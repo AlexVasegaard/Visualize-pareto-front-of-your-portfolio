@@ -1,0 +1,146 @@
+import numpy as np
+import pandas as pd
+from yahoofinancials import YahooFinancials
+from datetime import datetime
+import random
+import plotly.express as px
+
+#variables
+assets = ['TSLA', 'MSFT', 'FB']
+len_assets = len(assets)
+end_date_today = datetime.today().strftime('%Y-%m-%d')
+
+
+yahoo_financials = YahooFinancials(assets)
+data = yahoo_financials.get_historical_price_data(start_date='2020-01-01', 
+                                                  end_date=end_date_today, 
+                                                  time_interval='daily')
+prices_df = pd.DataFrame({
+    a: {x['formatted_date']: x['adjclose'] for x in data[a]['prices']} for a in assets
+})
+ret_data = prices_df.pct_change()[1:]
+
+
+def return_and_std(weights, ret_data):
+    #return
+    weighted_returns = ret_data*weights
+    daily_portfolio_return = np.mean(weighted_returns.sum(axis=1))
+
+    #covariance
+    matrix_covariance_portfolio = (ret_data.cov())*252
+    portfolio_variance = np.dot(weights.T,np.dot(matrix_covariance_portfolio, weights))
+
+    #standard deviation (risk of portfolio)
+    portfolio_risk = np.sqrt(portfolio_variance)
+    
+    return(daily_portfolio_return, portfolio_risk)
+
+#normalize fucntion
+def normalizer(hey):
+    #hey = np.array([[3,-3,3],[1,2,3],[1,-1,0],[0,100,-10]])
+    hey_min = np.min(hey,axis=1)
+    hey = hey+(np.abs(hey_min)*np.ones(hey.shape).T).T
+    hey2 = (hey.T/(np.sum(hey,axis=1))).T
+    return(hey2)
+
+def random_weight_gen(n,d):
+    weights = np.zeros((n,d))
+    weights[:,0] = np.random.uniform(0,1,n)
+    for i in range(n):
+        for j in range(d-2):
+            weights[i,j+1] = np.random.uniform(0,np.sum(weights[i,:j+2]))
+    for i in range(n):
+        weights[i,d-1] = 1-np.sum(weights[i,:d-1])
+    return(weights)
+    
+#pareto front identifier
+def pareto_front(solutions):
+    #solutions = np.array([[1,0.8],[0.9,0.6],[0.5,0.5], [0.3,0.3], [0.7,0.7], [0.2,0.6]])
+    max_obj = [1,-1] #where 1 is yes and -1 is min
+    N,D = solutions.shape
+    #convert into pure maximisation problem
+    solutions = solutions*max_obj
+
+    #count non-dominated solutions 
+    initial = np.zeros((1,D))
+    non_dominated_set = np.reshape(solutions[0,:], ((1,D)))
+    idx = list([0])
+    for i in range(1,N):
+        comparison = solutions[i,:] > non_dominated_set
+        #improves on at least one objective for all solutions
+        if all(np.sum(comparison,axis=1)>=1):  
+            #completely better (delete the dominated)
+            inf_loc = np.where(np.sum(comparison,axis=1)==D)[0]
+            if len(inf_loc) != 0:
+                non_dominated_set = np.delete(non_dominated_set, inf_loc,0)
+                for l in range(len(inf_loc)):
+                    idx.pop(int(inf_loc[l]))
+                    
+            #add to non dom set
+            non_dominated_set = np.concatenate((non_dominated_set, [solutions[i,:]]), axis=0)
+            idx.append(i)
+    #reconvert back
+    non_dominated_set = non_dominated_set*max_obj
+    return(non_dominated_set, idx)
+
+
+#multiobjective setting maximise returns and minimize risk
+pop_size = 50
+#initial pop
+pop = np.ones((pop_size, len_assets))/len_assets
+res = return_and_std(np.ones(len_assets)/len_assets, ret_data)
+pop_evaluation_special = np.ones((pop_size,2))*res
+
+#main loop
+N_prev_pareto_sols = 50 #found pareto front in previous loop
+for g in range(20):
+    pop_new = np.copy(pop)
+    #simple random modifier algorithm to investigate solution space
+    #modifies original 
+    for i in range(pop_size):
+        list_idxs = list(range(0,len_assets))
+        idx1 = list_idxs.pop(np.random.randint(0,len_assets))
+        idx2 = list_idxs.pop(np.random.randint(0,len_assets-1))
+        change = random.random()-0.5
+        pop_new[i,idx1] = pop_new[i,idx1] + change
+        pop_new[i,idx2] = pop_new[i,idx2] - change
+    pop_new = normalizer(pop_new)  #(now you have original pop and modified new pop)
+    
+    #concatenate 
+    entire_pop = np.concatenate((pop, pop_new), axis=0)
+    
+    #evaluate and find pareto front
+    entire_pop_evaluation = np.zeros((pop.shape[0],2))
+    entire_pop_evaluation[0:N_prev_pareto_sols,:] = pop_evaluation_special
+    #start from evaluation of solutions we havent evaluated yet
+    for i in range(N_prev_pareto_sols, pop_size):
+        entire_pop_evaluation[i,:] = return_and_std(entire_pop[i,:], ret_data)
+    
+    #identify pareto sols + add them in the loop for next iteration
+    pareto_sols = pareto_front(entire_pop_evaluation)
+    N_prev_pareto_sols = len(pareto_sols[1])
+    pop = entire_pop[pareto_sols[1],:]
+    pop_evaluation_special = pareto_sols[0]
+    
+    #fill remaining solutions with randomly generated
+    if N_prev_pareto_sols <= pop_size:
+        sols = random_weight_gen(pop_size-N_prev_pareto_sols, len_assets)
+        pop = np.concatenate((pop, sols), axis=0)
+    
+    if N_prev_pareto_sols >= pop_size:
+        pop = pop[:pop_size,:]
+
+#concate into dataframe        
+pop = np.round(pop,2)
+assetdists = list()
+for i in range(pop.shape[0]):
+    assetdists.append(np.array2string(pop[i,:]))
+front = pd.DataFrame({'exp returns': pop_evaluation_special[:,0],
+                      'std (risk)' : pop_evaluation_special[:,1],
+                      'asset dist' : assetdists
+                      })
+#plotly
+fig = px.scatter(data_frame = front,x = 'std (risk)', y = 'exp returns', 
+                 hover_name = 'asset dist', opacity = .9, title='Pareto front of portfolio:'+' '.join(assets))
+fig.show()
+
